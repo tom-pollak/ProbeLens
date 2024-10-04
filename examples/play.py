@@ -1,5 +1,4 @@
 # %%
-# ███████████████████████████  Capturing Activations  ████████████████████████████
 
 import json
 import torch
@@ -20,10 +19,11 @@ sae, cfg_dict, sparsity = SAE.from_pretrained(
 )
 hook_point = sae.cfg.hook_name
 
+# %%
+# ███████████████████████████  Capturing Activations  ████████████████████████████
 
 def filter_fn(activations):
     return activations[:, -1:, :]
-
 
 store = ActivationStore(
     model, hook_point, class_names=["negative", "positive"], act_filter_fn=filter_fn
@@ -38,6 +38,7 @@ num_rows = len(prompts)
 prompts_train, prompts_test = prompts[: num_rows // 2], prompts[num_rows // 2 :]
 labels_train, labels_test = labels[: num_rows // 2], labels[num_rows // 2 :]
 
+# Train
 store.set_split("train")
 store.add_labels(labels_train)
 
@@ -46,9 +47,7 @@ for i in range(0, len(prompts_train), batch_size):
     batch = prompts_train[i : i + batch_size]
     model(batch)
 
-###
-
-
+# Test
 store.set_split("test")
 store.add_labels(labels_test)
 
@@ -57,41 +56,23 @@ for i in range(0, len(prompts_test), batch_size):
     batch = prompts_test[i : i + batch_size]
     model(batch)
 
-hf_dataset = store.compile()
-# %%
-
-# sae_store.add_labels(labels)
-
-activation_dir = "./activations"
-store.save_all(activation_dir)
-# sae_store.save_all(activation_dir)
-
-store._detach()
-# sae_store.detach()
+# Compile Dataset
+dataset = store.compile_dataset()
+store.detach()
+print(dataset)
 
 # %%
 # ███████████████████████████  Training Probes  ████████████████████████████
 
 
 probe_trainer = ProbeTrainer(
-    store,
-    wandb_project="ProbeLens3",
-    label_names=["negative", "positive"],
+    dataset,
+    flatten_T="batch",
+    wandb_project="ProbeLens4",
     max_iter=1000,
 )
-probe_trainer.train_probe(hook_point)
-probe_trainer.save_models("./probes")
-
-# Similarly, initialize ProbeTrainer for SAE model hooks if needed
-# sae_probe_trainer = ProbeTrainer(
-#     sae_store,
-#     project_name="ProbeLens_SAE",
-#     metrics=[accuracy_score, precision_score, recall_score, f1_score],
-#     model_class=LogisticRegression,
-#     max_iter=1000
-# )
-# sae_probe_trainer.train_probe(hook_point)
-# sae_probe_trainer.save_models("./probes_sae")
+probe_trainer.train()
+probe_trainer.save_probes("./probes")
 
 # %%
 # ███████████████████████████  Visualizing Results  ████████████████████████████
