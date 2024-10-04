@@ -19,32 +19,54 @@ sae, cfg_dict, sparsity = SAE.from_pretrained(
     release="gpt2-small-res-jb", sae_id="blocks.7.hook_resid_pre", device=device
 )
 hook_point = sae.cfg.hook_name
-# model.add_sae(sae, hook_point)
-
-model_store = ActivationStore(model, hook_point, t_slice=-1)
-# sae_store = ActivationStore(sae, "hook_sae_acts_post")
 
 
-# Load prompts and labels from data.json
+def filter_fn(activations):
+    return activations[:, -1:, :]
+
+
+store = ActivationStore(
+    model, hook_point, class_names=["negative", "positive"], act_filter_fn=filter_fn
+)
+
 with open("data/sentiment.json", "r") as file:
     data = json.load(file)
     prompts = data["prompts"]
     labels = data["labels"]
 
-model_store.add_labels(labels)
+num_rows = len(prompts)
+prompts_train, prompts_test = prompts[: num_rows // 2], prompts[num_rows // 2 :]
+labels_train, labels_test = labels[: num_rows // 2], labels[num_rows // 2 :]
+
+store.set_split("train")
+store.add_labels(labels_train)
 
 batch_size = 16
-for i in range(0, len(prompts), batch_size):
-    batch = prompts[i : i + batch_size]
+for i in range(0, len(prompts_train), batch_size):
+    batch = prompts_train[i : i + batch_size]
     model(batch)
+
+###
+
+
+store.set_split("test")
+store.add_labels(labels_test)
+
+batch_size = 16
+for i in range(0, len(prompts_test), batch_size):
+    batch = prompts_test[i : i + batch_size]
+    model(batch)
+
+hf_dataset = store.compile()
+# %%
 
 # sae_store.add_labels(labels)
 
 activation_dir = "./activations"
-model_store.save_all(activation_dir)
+store.save_all(activation_dir)
 # sae_store.save_all(activation_dir)
 
-model_store.detach()
+store._detach()
 # sae_store.detach()
 
 # %%
@@ -52,7 +74,7 @@ model_store.detach()
 
 
 probe_trainer = ProbeTrainer(
-    model_store,
+    store,
     wandb_project="ProbeLens3",
     label_names=["negative", "positive"],
     max_iter=1000,
