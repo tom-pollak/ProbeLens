@@ -1,13 +1,14 @@
-from pathlib import Path
-from collections import defaultdict
-from typing import List, Dict, Union, Optional
-import numpy as np
-from jaxtyping import Float
-
-import torch
+from typing import List, Union, Callable
 from transformer_lens import HookedTransformer
 from transformer_lens.hook_points import HookPoint
 from sae_lens import SAE
+from jaxtyping import Float
+from datasets import Dataset, DatasetDict, Features, Array3D, ClassLabel
+import numpy as np
+
+
+def _identity_filter(activations: np.ndarray) -> np.ndarray:
+    return activations
 
 
 class ActivationStore:
@@ -17,79 +18,104 @@ class ActivationStore:
         self,
         model: Union[HookedTransformer, SAE],
         hook_names: Union[str, List[str]],
-        t_slice: Optional[Union[int, slice]] = None,
+        class_names: list[str],
+        act_filter_fn: Callable[
+            [Float[np.ndarray, "B T D"]], Float[np.ndarray, "B T_p D"]
+        ] = _identity_filter,
+        splits=("train", "test"),
     ):
+        """
+        act_filter_fn: Select which activations to store
+        splits: DatasetDict splits. `current_split` is initialized as first one
+        """
         self.model = model
         self.hook_names = [hook_names] if isinstance(hook_names, str) else hook_names
-        self.activations: Dict[str, List[Float[np.ndarray, "B T D"]]] = defaultdict(list)  # fmt: off
-        self.labels: list[int] = []
-
-        self.t_slice = (
-            slice(t_slice, t_slice + 1 if t_slice != -1 else None)
-            if isinstance(t_slice, int)
-            else t_slice
+        self.class_names = class_names
+        self.act_filter_fn = act_filter_fn
+        self.class_labels = ClassLabel(
+            num_classes=len(self.class_names), names=self.class_names
         )
+        self.current_split: str = splits[0]
+        self.dataset_dict = {
+            split: {
+                "activations": {hook: [] for hook in self.hook_names},
+                "labels": [],
+            }
+            for split in splits
+        }
 
         for hook_name in self.hook_names:
-            self.model.add_hook(hook_name, self.hook_fn, level=self.hook_level)
+            self.model.add_hook(hook_name, self._hook_fn, level=self.hook_level)
 
-    def hook_fn(
-        self, tensor: Float[torch.Tensor, "B T D"], hook: HookPoint
-    ) -> Float[torch.Tensor, "B T D"]:
-        acts_np = tensor.detach().cpu().numpy()
+    def set_split(self, split: str):
+        """
+        Set the current dataset split (e.g., 'train', 'test').
+        """
+        if split not in self.dataset_dict:
+            raise ValueError(
+                f"Invalid split name: {split}. Choose from 'train', 'val', 'test'."
+            )
+        self.current_split = split
 
-        if self.t_slice is not None:
-            acts_np = acts_np[:, self.t_slice, :]  # apply to T
+    def add_labels(self, labels: List[int]):
+        """
+        Add labels for a specific split. Defaults to current split.
+        """
+        if self.current_split not in self.dataset_dict:
+            raise ValueError(
+                f"Invalid split name: {self.current_split}. Choose from 'train', 'val', 'test'."
+            )
+        self.dataset_dict[self.current_split]["labels"].extend(labels)
 
-        assert hook.name is not None
-        self.activations[hook.name].append(acts_np)
-        return tensor
+    def compile(self):
+        self._detach()
 
-    def detach(self):
+        hf_dataset = DatasetDict()
+        for split in self.dataset_dict:
+            print(f"Split: {split}")
+            split_data = self.dataset_dict[split]
+            split_data["labels"] = np.array(split_data["labels"])
+            features = Features(
+                {
+                    "activations": {},
+                    "labels": self.class_labels,
+                }
+            )
+            print(split_data)
+            for hook_name in split_data["activations"]:
+                # Stack activations [np.ndarray] => np.ndarray
+                activations = np.concatenate(
+                    split_data["activations"][hook_name], axis=0
+                )
+                if activations.ndim != 3:
+                    raise ValueError(
+                        f"Activations are expected to be of shape (B, T, D). Given: {activations.shape}"
+                    )
+                split_data["activations"][hook_name] = activations
+
+                # Cast dataset into efficient format
+                features["activations"][hook_name] = Array3D(
+                    shape=activations.shape, dtype="float32"
+                )
+
+                print(
+                    f"Activations shape for {hook_name}: {np.array(split_data['activations'][hook_name]).shape}"
+                )
+
+            print(f"Labels count: {len(split_data['labels'])}")
+            print("Features:", features)
+
+            hf_dataset[split] = Dataset.from_dict(split_data, features=features)
+
+        print("dataset compiled")
+        return hf_dataset
+
+    def _detach(self):
         self.model.reset_hooks(level=self.hook_level)
 
-    def add_labels(self, labels: list[int]):
-        self.labels.extend(labels)
-
-    def save_all(self, save_dir: Union[Path, str]):
-        if isinstance(save_dir, str):
-            save_dir = Path(save_dir)
-        save_dir.mkdir(parents=True, exist_ok=True)
-
-        for hook_name in self.hook_names:
-            assert (
-                hook_name in self.activations
-            ), f"No activations for hook: {hook_name}"
-            if not self.activations[hook_name]:
-                continue
-
-            stacked_acts = np.concatenate(self.activations[hook_name], axis=0)
-            act_path = save_dir / f"{hook_name}_activations.npy"
-            np.save(act_path, stacked_acts)
-            print(f"Saved activations for {hook_name} to {act_path}")
-
-        if self.labels:
-            labels_path = save_dir / "labels.npy"
-            np.save(labels_path, np.array(self.labels))
-            print(f"Saved labels to {labels_path}")
-
-    @classmethod
-    def load_all(
-        cls, model: Union[HookedTransformer, SAE], directory: Union[Path, str]
-    ):
-        if isinstance(directory, str):
-            directory = Path(directory)
-        hook_names = [p.stem.split("_")[0] for p in directory.glob("*_activations.npy")]
-        hook_handler = cls(model, hook_names)
-        for hook_name in hook_names:
-            activation_path = directory / f"{hook_name}_activations.npy"
-            assert activation_path.exists()
-            hook_handler.activations[hook_name] = np.load(activation_path)
-            print(f"Loaded activations for {hook_name} from {activation_path}")
-
-            labels_path = directory / "labels.npy"
-            if labels_path.exists():
-                hook_handler.labels = np.load(labels_path).tolist()
-                print(f"Loaded labels for {hook_name} from {labels_path}")
-
-        return hook_handler
+    def _hook_fn(self, tensor, hook: HookPoint):
+        assert hook.name is not None
+        acts = tensor.detach().cpu().numpy()
+        acts = self.act_filter_fn(acts)
+        self.dataset_dict[self.current_split]["activations"][hook.name].append(acts)  # type: ignore
+        return tensor
